@@ -75,6 +75,28 @@ module ActiveRecord
       end
     end
 
+    describe HyperBase, '.find_by_hql' do
+      fixtures :pages
+
+      it "should return the cells matching the hql specified" do
+        pages = Page.find_by_hql("SELECT * FROM pages LIMIT=1")
+        pages.length.should == 1
+        page = pages.first
+        page.class.should == Page
+        page.name.should == "LOLcats and more"
+        page.url.should == "http://www.icanhascheezburger.com"
+      end
+
+      it "should respond to the find_by_sql alias" do
+        pages = Page.find_by_hql("SELECT * FROM pages LIMIT=1")
+        pages.length.should == 1
+        page = pages.first
+        page.class.should == Page
+        page.name.should == "LOLcats and more"
+        page.url.should == "http://www.icanhascheezburger.com"
+      end
+    end
+
     describe HyperBase, '.find_initial' do
       fixtures :pages
 
@@ -130,6 +152,48 @@ module ActiveRecord
         Page.find(:all).length.should == 3
         pages = Page.find(:all, :limit => 2)
         pages.length.should == 2
+      end
+
+      it "should support the start_row and end_row option" do
+        p = Page.new({:ROW => 'row key', :name => 'new entry'})
+        p.save.should be_true
+        pages = Page.find(:all)
+        pages.length.should == 3
+        start_row = pages[1].ROW
+        end_row = pages[2].ROW
+
+        pages_2 = Page.find(:all, :start_row => start_row, :end_row => end_row)
+        pages_2.length.should == 2
+        pages_2[0].ROW.should == start_row
+        pages_2[1].ROW.should == end_row
+      end
+
+      it "should support the row_keys option" do
+        p = Page.new({:ROW => 'row key', :name => 'new entry'})
+        p.save.should be_true
+        pages = Page.find(:all)
+        pages.length.should == 3
+        row_key_1 = pages[1].ROW
+        row_key_2 = pages[2].ROW
+
+        pages_2 = Page.find(:all, :row_keys => [row_key_1, row_key_2])
+        pages_2.length.should == 2
+        pages_2[0].ROW.should == row_key_1
+        pages_2[1].ROW.should == row_key_2
+      end
+
+      it "should support the row_intervals option" do
+        p = Page.new({:ROW => 'row key', :name => 'new entry'})
+        p.save.should be_true
+        pages = Page.find(:all)
+        pages.length.should == 3
+        row_key_1 = pages[1].ROW
+        row_key_2 = pages[2].ROW
+
+        pages_2 = Page.find(:all, :row_intervals => [[row_key_1, row_key_2]])
+        pages_2.length.should == 2
+        pages_2[0].ROW.should == row_key_1
+        pages_2[1].ROW.should == row_key_2
       end
 
       it "should not support finder conditions not in Hash format" do
@@ -647,5 +711,179 @@ module ActiveRecord
         end
       end
     end
+
+    describe HyperBase, '.scanner' do
+      fixtures :pages
+
+      it "should return a scanner object from open_scanner" do
+        scan_spec = Hypertable::ThriftGen::ScanSpec.new
+        scanner = Page.open_scanner(scan_spec)
+        scanner.class.should == Fixnum
+        Page.close_scanner(scanner)
+      end
+
+      it "should yield a scanner object from with_scanner" do
+        scan_spec = Hypertable::ThriftGen::ScanSpec.new
+        Page.with_scanner(scan_spec) do |scanner|
+          scanner.is_a?(Fixnum).should be_true
+        end
+      end
+
+      it "should yield a scanner object from with_scanner" do
+        scan_spec = Hypertable::ThriftGen::ScanSpec.new
+        Page.with_scanner(scan_spec) do |scanner|
+          scanner.is_a?(Fixnum).should be_true
+        end
+      end
+
+      it "should support native each_cell scanner method" do
+        scan_spec = Hypertable::ThriftGen::ScanSpec.new
+        cell_count = 0
+        Page.with_scanner(scan_spec) do |scanner|
+          Page.each_cell(scanner) do |cell|
+            cell.is_a?(Hypertable::ThriftGen::Cell).should be_true
+            cell_count += 1
+          end
+        end
+        cell_count.should == 4
+      end
+
+      it "should support native each_cell_as_arrays scanner method" do
+        scan_spec = Hypertable::ThriftGen::ScanSpec.new
+        cell_count = 0
+        Page.with_scanner(scan_spec) do |scanner|
+          Page.each_cell_as_arrays(scanner) do |cell|
+            cell.is_a?(Array).should be_true
+            cell_count += 1
+          end
+        end
+        cell_count.should == 4
+      end
+
+      it "should return a scan spec from find_to_scan_spec" do
+        scan_spec = Page.find_to_scan_spec(:all, :limit => 1)
+        scan_spec.is_a?(Hypertable::ThriftGen::ScanSpec).should be_true
+        scan_spec.row_limit.should == 1
+      end
+
+      it "should yield a scanner to a block from find_with_scanner" do
+        cell_count = 0
+        Page.find_with_scanner(:all, :limit => 1) do |scanner|
+          scanner.is_a?(Fixnum).should be_true
+          Page.each_cell_as_arrays(scanner) do |cell|
+            cell.is_a?(Array).should be_true
+            cell_count += 1
+          end
+        end
+        cell_count.should == 2
+      end
+
+      it "should yield each row when calling find_each_row_as_arrays" do
+        cell_count = 0
+        row_count = 0
+
+        Page.find_each_row_as_arrays(:all) do |row|
+          row.is_a?(Array).should be_true
+          row_count += 1
+          cell_count += row.length
+        end
+
+        row_count.should == 2
+        cell_count.should == 4
+      end
+
+      it "should convert an array of cells into a hash" do
+        Page.find_each_row_as_arrays(:all, :limit => 1) do |row|
+          page_hash = Page.convert_cells_to_hashes(row).first
+          page_hash.is_a?(Hash).should be_true
+          page_hash['ROW'].should == "page_1"
+          page_hash['name'].should == "LOLcats and more"
+          page_hash['url'].should == "http://www.icanhascheezburger.com"
+        end
+      end
+
+      it "should yield each row as a HyperRecord object when calling find_each_row" do
+        row_count = 0
+
+        Page.find_each_row(:all) do |row|
+          row.is_a?(Page).should be_true
+          row_count += 1
+        end
+
+        row_count.should == 2
+      end
+
+      it "should support native each_row scanner method"
+      it "should support native each_row_as_arrays scanner method"
+    end
+
+    describe HyperBase, '.row_key_attributes' do
+      it "should extract attributes out of the row key" do
+        Page.class_eval do
+          row_key_attributes :regex => /_(\d{4}-\d{2}-\d{2}_\d{2}:\d{2})$/, :attribute_names => [:timestamp]
+        end
+
+        p = Page.new
+        p.ROW = "apikey_1066_2008-12-25_03:00"
+        p.timestamp.should == '2008-12-25_03:00'
+      end
+
+      it "should return empty string if regex doesn't match row key" do
+        Page.class_eval do
+          row_key_attributes :regex => /will_not_match/, :attribute_names => [:foo]
+        end
+
+        p = Page.new
+        p.ROW = "row key"
+        p.foo.should == ''
+      end
+
+      it "should allow multiple attributes to be extracted from row key" do
+        Page.class_eval do
+          row_key_attributes :regex => /^sponsorship_([a-z0-9]+)_(\d{4}-\d{2}-\d{2}_\d{2}:\d{2})_(\d+)$/, :attribute_names => [:sponsorship_id, :timestamp, :partner_id]
+        end
+
+        p = Page.new
+        p.ROW = "sponsorship_61066_2009-04-12_07:00_166"
+        p.sponsorship_id.should == '61066'
+        p.timestamp.should == '2009-04-12_07:00'
+        p.partner_id.should == '166'
+      end
+
+      it "should return empty string on partial match" do
+        Page.class_eval do
+          row_key_attributes :regex => /^sponsorship_([a-z0-9]+)_(\d{4}-\d{2}-\d{2}_\d{2}:\d{2})_?(\d+)?$/, :attribute_names => [:sponsorship_id, :timestamp, :partner_id]
+        end
+
+        p = Page.new
+        p.ROW = "sponsorship_61066_2009-04-12_07:00"
+        p.sponsorship_id.should == '61066'
+        p.timestamp.should == '2009-04-12_07:00'
+        p.partner_id.should == ''
+      end
+
+      it "should return empty string on partial match in middle" do
+        Page.class_eval do
+          row_key_attributes :regex => /^sponsorship_([a-z0-9]+)_?(\d{4}-\d{2}-\d{2}_\d{2}:\d{2})?_(\d+)$/, :attribute_names => [:sponsorship_id, :timestamp, :partner_id]
+        end
+
+        p = Page.new
+        p.ROW = "sponsorship_61066_166"
+        p.sponsorship_id.should == '61066'
+        p.timestamp.should == ''
+        p.partner_id.should == '166'
+      end
+
+      it "should return empty string on nil ROW key" do
+        Page.class_eval do
+          row_key_attributes :regex => /will_not_match/, :attribute_names => [:foo]
+        end
+
+        p = Page.new
+        p.ROW.should be_nil
+        p.foo.should == ''
+      end
+    end
   end
 end
+

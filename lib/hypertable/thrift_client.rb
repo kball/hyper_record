@@ -2,9 +2,8 @@
 $:.push(File.dirname(__FILE__) + '/gen-rb')
 
 require 'thrift'
-require 'thrift/protocol/binaryprotocolaccelerated'
-require 'HqlService'
-require File.dirname(__FILE__) + '/thrift_transport_monkey_patch'
+require 'thrift/protocol/binary_protocol_accelerated'
+require 'hql_service'
 
 module Hypertable
   class ThriftClient < ThriftGen::HqlService::Client
@@ -28,7 +27,7 @@ module Hypertable
     # more convenience methods
 
     def with_scanner(table, scan_spec)
-      scanner = open_scanner(table, scan_spec)
+      scanner = open_scanner(table, scan_spec, true)
       begin
         yield scanner
       ensure
@@ -52,6 +51,33 @@ module Hypertable
       while (cells.size > 0)
         cells.each {|cell| yield cell}
         cells = next_cells(scanner);
+      end
+    end
+
+    def each_cell_as_arrays(scanner)
+      cells = next_cells_as_arrays(scanner);
+
+      while (cells.size > 0)
+        cells.each {|cell| yield cell}
+        cells = next_cells_as_arrays(scanner);
+      end
+    end
+
+    def each_row(scanner)
+      row = next_row(scanner);
+
+      while row
+        yield row
+        row = next_row(scanner);
+      end
+    end
+
+    def each_row_as_arrays(scanner)
+      row = next_row_as_arrays(scanner);
+
+      while row
+        yield row
+        row = next_row_as_arrays(scanner);
       end
     end
   end

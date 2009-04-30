@@ -47,6 +47,24 @@ module ActiveRecord
       self.attributes[self.class.primary_key]
     end
 
+    # Allows the save operation to be performed with a specific
+    # mutator.  By default, a new mutator is opened, flushed and closed for
+    # each save operation.  Write-heavy application may wish to manually
+    # manage mutator flushes (which happens when the mutator is closed) at 
+    # the application-layer in order to increase write throughput.
+    #
+    #   m = Page.open_mutator
+    #
+    #   p1 = Page.new({:ROW => 'created_with_mutator_1', :url => 'url_1'})
+    #   p1.save_with_mutator!(m)
+    #   p2 = Page.new({:ROW => 'created_with_mutator_2', :url => 'url_2'})
+    #   p2.save_with_mutator!(m)
+    #
+    #   Page.close_mutator(m)
+    # 
+    # Future versions of hypertable will provide a mutator that automatically
+    # periodically flushes.  This feature is expected by Summary 2009.  At
+    # that time, manually managing the mutator at the 
     def save_with_mutator(mutator)
       create_or_update_with_mutator(mutator)
     end
@@ -61,6 +79,8 @@ module ActiveRecord
       result != false
     end
 
+    # Destroy an object.  Since Hypertable does not have foreign keys,
+    # association cells must be removed manually.
     def destroy
       # check for associations and delete association cells as necessary
       for reflection_key in self.class.reflections.keys
@@ -80,6 +100,10 @@ module ActiveRecord
       self.class.connection.delete_rows(self.class.table_name, [self.ROW])
     end
 
+    # Casts the attribute to an integer before performing the increment.  This
+    # is necessary because Hypertable only supports integer types at the
+    # moment.  The cast has the effect of initializing nil values (and most
+    # string values) to zero.
     def increment(attribute, by=1)
       self[attribute] = self[attribute].to_i
       self[attribute] += by
@@ -100,7 +124,7 @@ module ActiveRecord
     end
 
     # Returns a copy of the attributes hash where all the values have been
-    # safely quoted for insertion.  Translated qualified columns from a Hash
+    # safely quoted for insertion.  Translates qualified columns from a Hash
     # value in Ruby to a flat list of attributes.
     #
     # => {
@@ -210,25 +234,112 @@ module ActiveRecord
         end
       end
 
-      def find_initial(options)
-        options.update(:limit => 1)
-        find_by_options(options).first
+      # Converts incoming finder options into a scan spec.  A scan spec
+      # is an object used to describe query parameters (columns to retrieve,
+      # number of rows to retrieve, row key ranges) for Hypertable queries.
+      def find_to_scan_spec(*args)
+        options = args.extract_options!
+        options[:scan_spec] = true
+        args << options
+        find(*args)
       end
 
-      def find_by_options(options)
+      # Returns a scanner object that allows you to iterate over the 
+      # result set using the lower-level Thrift client APIs methods that
+      # require a scanner object. e.g.,
+      #
+      # Page.find_with_scanner(:all, :limit => 1) do |scanner|
+      #   Page.each_cell_as_arrays(scanner) do |cell|
+      #     ...
+      #   end
+      # end
+      #
+      # See the Thrift Client API documentation for more detail.
+      # http://hypertable.org/thrift-api-ref/index.html
+      def find_with_scanner(*args, &block)
+        scan_spec = find_to_scan_spec(*args)
+        with_scanner(scan_spec, &block)
+      end
+
+      # Returns each row matching the finder options as a HyperRecord
+      # object.  Each object is yielded to the caller so that large queries 
+      # can be processed one object at a time without pulling the entire 
+      # result set into memory.
+      #
+      # Page.find_each_row(:all) do |page|
+      #   ...
+      # end
+      def find_each_row(*args)
+        find_each_row_as_arrays(*args) do |row|
+          yield convert_cells_to_instantiated_rows(row).first
+        end
+      end
+
+      # Returns each row matching the finder options as an array of cells
+      # in native array format.  Each row is yielded to the caller so that
+      # large queries can be processed one row at a time without pulling
+      # the entire result set into memory.
+      #
+      # Page.find_each_row(:all) do |page_as_array_of_cells|
+      #   ...
+      # end
+      def find_each_row_as_arrays(*args)
+        scan_spec = find_to_scan_spec(*args)
+        with_scanner(scan_spec) do |scanner|
+          row = []
+          current_row_key = nil
+
+          each_cell_as_arrays(scanner) do |cell|
+            current_row_key ||= cell[ROW_KEY_OFFSET]
+
+            if cell[ROW_KEY_OFFSET] == current_row_key
+              row << cell
+            else
+              yield row
+              row = [cell]
+              current_row_key = cell[ROW_KEY_OFFSET]
+            end
+          end 
+
+          yield row unless row.empty?
+        end
+      end
+
+      # Each hypertable query requires some default options (e.g., table name)
+      # that are set here if not specified in the query.
+      def set_default_options(options)
         options[:table_name] ||= table_name
         options[:columns] ||= columns
 
         # Don't request the ROW key explicitly, it always comes back
-        options[:select] ||= qualified_column_names_without_row_key.map{|c| connection.hypertable_column_name(c, table_name)}
+        options[:select] ||= qualified_column_names_without_row_key.map{|c| 
+          connection.hypertable_column_name(c, table_name)
+        }
+      end
 
-        rows = Hash.new{|h,k| h[k] = []}
+      # Return the first record that matches the finder options.
+      def find_initial(options)
+        options.update(:limit => 1)
 
-        # Cells come back in native array format.
-        # [ row_key, column_family, column_qualifier, value, timestamp ]
-        for cell in connection.execute_with_options(options)
-          rows[cell[ROW_KEY_OFFSET]] << cell
+        if options[:scan_spec]
+          find_by_options(options)
+        else
+          find_by_options(options).first
         end
+      end
+
+      # Return an array of records matching the finder options.
+      def find_by_options(options)
+        set_default_options(options)
+
+        # If requested, instead of retrieving the matching cells from
+        # Hypertable, simply return a scan spec that matches the finder
+        # options.
+        if options[:scan_spec]
+          return connection.convert_options_to_scan_spec(options)
+        end
+
+        cells = connection.execute_with_options(options)
 
         if HyperBase.log_calls
           msg = [ "Select" ]
@@ -246,39 +357,74 @@ module ActiveRecord
           # puts msg
         end
 
-        rows.values.map{|row|
-          row_with_mapped_column_names = {
-            'ROW' => row.first[ROW_KEY_OFFSET]
-          }
-
-          for cell in row
-            family = connection.rubify_column_name(cell[COLUMN_FAMILY_OFFSET])
-
-            if !cell[COLUMN_QUALIFIER_OFFSET].blank?
-              row_with_mapped_column_names[family] ||= {}
-              row_with_mapped_column_names[family][cell[COLUMN_QUALIFIER_OFFSET]] = cell[VALUE_OFFSET]
-            else
-              row_with_mapped_column_names[family] = cell[VALUE_OFFSET]
-            end
-          end
-
-          # make sure that the resulting object has attributes for all
-          # columns - even ones that aren't in the response (due to limited
-          # select)
-          for column in column_families_without_row_key
-            if !row_with_mapped_column_names.has_key?(column.name)
-              if column.is_a?(ActiveRecord::ConnectionAdapters::QualifiedColumn)
-                row_with_mapped_column_names[column.name] = {}
-              else
-                row_with_mapped_column_names[column.name] = nil
-              end
-            end
-          end
-
-          instantiate(row_with_mapped_column_names)
-        }
+        convert_cells_to_instantiated_rows(cells)
       end
 
+      # Converts cells that come back from Hypertable into hashes.  Each
+      # hash represents a separate record (where each cell that has the same
+      # row key is considered one record).
+      def convert_cells_to_hashes(cells)
+        rows = []
+        current_row = {}
+
+        # Cells are guaranteed to come back in row key order, so assemble
+        # a row by iterating over each cell and checking to see if the row key
+        # has changed.  If it has, then the row is complete and needs to be
+        # instantiated before processing the next cell.
+        cells.each_with_index do |cell, i|
+          current_row['ROW'] = cell[ROW_KEY_OFFSET]
+
+          family = connection.rubify_column_name(cell[COLUMN_FAMILY_OFFSET])
+
+          if !cell[COLUMN_QUALIFIER_OFFSET].blank?
+            current_row[family] ||= {}
+            current_row[family][cell[COLUMN_QUALIFIER_OFFSET]] = cell[VALUE_OFFSET]
+          else
+            current_row[family] = cell[VALUE_OFFSET]
+          end
+
+          # Instantiate the row if we've processed all cells for the row
+          next_index = i + 1
+
+          # Check to see if next cell has different row key or if we're at
+          # the end of the cell stream.
+          if (cells[next_index] and cells[next_index][ROW_KEY_OFFSET] != current_row['ROW']) or next_index >= cells.length
+            # Make sure that the resulting object has attributes for all
+            # columns - even ones that aren't in the response (due to limited
+            # select)
+            for col in column_families_without_row_key
+              if !current_row.has_key?(col.name)
+                if col.is_a?(ActiveRecord::ConnectionAdapters::QualifiedColumn)
+                  current_row[col.name] = {}
+                else
+                  current_row[col.name] = nil
+                end
+              end
+            end
+
+            rows << current_row
+            current_row = {}
+          end
+        end
+
+        rows
+      end
+
+      def convert_cells_to_instantiated_rows(cells)
+        convert_cells_to_hashes(cells).map{|row| instantiate(row)}
+      end
+
+      # Return the records that match a specific HQL query.
+      def find_by_hql(hql)
+        hql_result = connection.execute(hql)
+        cells_in_native_array_format = hql_result.cells.map do |c| 
+          connection.cell_native_array(c.row_key, c.column_family, c.column_qualifier, c.value)
+        end
+        convert_cells_to_instantiated_rows(cells_in_native_array_format)
+      end
+      alias :find_by_sql :find_by_hql
+
+      # Return multiple records by row keys.
       def find_from_ids(ids, options)
         expects_array = ids.first.kind_of?(Array)
         return ids.first if expects_array && ids.first.empty?
@@ -295,6 +441,7 @@ module ActiveRecord
         end
       end
 
+      # Return a single record identified by a row key.
       def find_one(id, options)
         return nil if id.blank?
 
@@ -384,6 +531,23 @@ module ActiveRecord
         }
       end
 
+      # row_key_attributes :regex => /_(\d{4}-\d{2}-\d{2}_\d{2}:\d{2})$/, :attribute_names => [:timestamp]
+      attr_accessor :row_key_attributes
+      def row_key_attributes(*attrs)
+        symbolized_attrs = attrs.first.symbolize_keys
+        regex = symbolized_attrs[:regex]
+        names = symbolized_attrs[:attribute_names]
+
+        names.each_with_index do |attribute_name, i|
+          self.class_eval %{
+            def #{attribute_name}
+              matches = self.ROW.to_s.match(#{regex.to_s.inspect})
+              matches ? (matches[#{i + 1}] || '') : ''
+            end
+          } 
+        end
+      end
+
       # Mutator methods - passed through straight to the Hypertable Adapter.
 
       # Return an open mutator on this table.
@@ -397,6 +561,40 @@ module ActiveRecord
 
       def flush_mutator(mutator)
         self.connection.flush_mutator(mutator)
+      end
+
+      # Scanner methods
+      def open_scanner(scan_spec)
+        self.connection.open_scanner(self.table_name, scan_spec)
+      end
+
+      def close_scanner(scanner)
+        self.connection.close_scanner(scanner)
+      end
+
+      def with_scanner(scan_spec, &block)
+        self.connection.with_scanner(self.table_name, scan_spec, &block)
+      end
+
+      # Iterator methods
+      def each_cell(scanner, &block)
+        self.connection.each_cell(scanner, &block)
+      end
+
+      def each_cell_as_arrays(scanner, &block)
+        self.connection.each_cell_as_arrays(scanner, &block)
+      end
+
+      def each_row(scanner, &block)
+        self.connection.each_row(scanner, &block)
+      end
+
+      def each_row_as_arrays(scanner, &block)
+        self.connection.each_row_as_arrays(scanner, &block)
+      end
+
+      def with_thrift_client
+        self.connection.with_thrift_client
       end
     end
   end
